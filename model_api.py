@@ -32,7 +32,7 @@ live agent too.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable
 
 from .actions import InterpreterConfig, Timeline, build_timeline
 from .labels import Chart, LabelEvent

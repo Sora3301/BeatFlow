@@ -14,7 +14,7 @@ sees them as simultaneous rather than 0.2 ms apart.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .actions import Commit, Op
 from .backends.base import TouchBackend

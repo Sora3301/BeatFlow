@@ -13,8 +13,9 @@ from .actions import InterpreterConfig, build_timeline
 from .backends import BackendUnavailable, DryRunBackend, UinputBackend, make_backend
 from .geometry import Geometry
 from .injector import Injector
-from .labels import LabelSet, open_labelset
+from .labels import open_labelset
 from .scheduler import TimelineRunner
+from .visualizer import RENDERERS, LiveModel, RenderProcess, Streamer, phase_map
 
 DEFAULT_DEVICE = "BeatFlow Virtual Touch"
 
@@ -149,6 +150,80 @@ def cmd_replay(args) -> int:
     return 0
 
 
+def cmd_watch(args) -> int:
+    """Play a chart in real time with a live visualizer attached."""
+    with open_labelset(_find_labelset(args.labels)) as ls:
+        chart = ls.chart(args.chart)
+    timeline = build_timeline(chart, _config(args))
+    if args.duration:
+        timeline.commits = [c for c in timeline.commits if c.t <= args.duration]
+    print(f"chart {chart.name}: {len(timeline.commits)} commits, {timeline.n_ops} ops, "
+          f"{timeline.duration:.1f}s   visualizer={args.viz}")
+
+    geometry = _geometry(args)
+    backend = make_backend(args.backend, capacity=args.capacity)
+    try:
+        backend.open()
+    except BackendUnavailable as exc:
+        print(f"cannot start {args.backend} backend: {exc}")
+        return 1
+
+    injector = Injector(backend, geometry, policy=args.policy)
+    model = LiveModel(phase_map(chart))
+    viz: RenderProcess | None = None
+    streamer: Streamer | None = None
+    # Chart time for the HUD; the model keeps monotonic timestamps for ages.
+    t0 = time.monotonic() + max(0.0, args.lead_in)
+    try:
+        if args.viz != "none":
+            # Only the terminal renderer has an ASCII mode; Tk ignores the flag.
+            extra = ("--ascii",) if args.viz_ascii and args.viz == "terminal" else ()
+            try:
+                viz = RenderProcess(
+                    args.viz, title=chart.name, capacity=args.capacity,
+                    fps=args.viz_fps, extra_args=extra,
+                )
+            except RuntimeError as exc:
+                print(f"visualizer unavailable: {exc}")
+                return 1
+            streamer = Streamer(model, viz, now=lambda: time.monotonic() - t0,
+                                fps=args.viz_fps).start()
+
+        def on_commit(sample, commit) -> None:
+            now = time.monotonic()
+            for op in commit.ops:
+                if op.kind == "release":
+                    model.release(op.key, now)
+                elif op.kind == "press":
+                    # Mirror the injector, not the timeline: a press the slot
+                    # allocator dropped must not show up as a finger.
+                    if injector.allocator.is_active(op.key):
+                        slot = injector.allocator.slot_of(op.key)
+                        model.press(op.key, -1 if slot is None else slot, op.x, op.y, now)
+                else:
+                    model.move(op.key, op.x, op.y, now)
+
+        runner = TimelineRunner(injector, speed=args.speed, lead_in=max(0.0, args.lead_in),
+                                on_commit=on_commit)
+        stats = runner.run(timeline)
+        injector.release_all()
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+        return 130
+    finally:
+        if streamer is not None:
+            streamer.stop()
+        if viz is not None:
+            viz.close({"frames": streamer.frames if streamer else 0,
+                       "commits": len(timeline.commits)})
+        backend.close()
+
+    print()
+    print(stats.format())
+    print(json.dumps(injector.stats.as_dict(), ensure_ascii=False))
+    return 0
+
+
 def cmd_selftest(args) -> int:
     """Press/move/release on the real device to prove the plumbing works."""
     geometry = _geometry(args)
@@ -237,6 +312,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dump", help="write recorded ops to this JSONL file")
     sp.set_defaults(func=cmd_replay)
 
+    sp = sub.add_parser("watch", help="play a chart in real time with a live 4-finger visualizer")
+    common(sp)
+    plan_opts(sp)
+    sp.add_argument("--chart", default=None)
+    sp.add_argument("--backend", choices=["dryrun", "uinput"], default="dryrun")
+    sp.add_argument("--viz", choices=["none", *sorted(RENDERERS)], default="terminal",
+                    help="renderer to attach (default terminal)")
+    sp.add_argument("--viz-fps", type=float, default=60.0, help="renderer frame rate")
+    sp.add_argument("--viz-ascii", action="store_true", help="ASCII glyphs in the terminal renderer")
+    sp.add_argument("--speed", type=float, default=1.0,
+                    help="1=realtime; the visualizer is only meaningful in realtime")
+    sp.add_argument("--duration", type=float, default=0.0, help="stop after N seconds of chart")
+    sp.add_argument("--policy", choices=["drop", "steal_lru"], default="steal_lru")
+    sp.add_argument("--lead-in", type=float, default=1.0,
+                    help="seconds to wait before the first frame (lets the window appear)")
+    sp.set_defaults(func=cmd_watch)
+
     sp = sub.add_parser("selftest", help="press/move/release on the real uinput device")
     common(sp)
     sp.add_argument("--repeat", type=int, default=1)
@@ -246,8 +338,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if getattr(args, "backend", "") == "dryrun" and getattr(args, "speed", None) == 1.0:
-        args.speed = 0.0
+    # `watch` is about watching, so a dry run must stay in realtime there.
+    if getattr(args, "command", "") != "watch":
+        if getattr(args, "backend", "") == "dryrun" and getattr(args, "speed", None) == 1.0:
+            args.speed = 0.0
     try:
         return args.func(args)
     except LookupError as exc:

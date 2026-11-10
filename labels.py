@@ -32,7 +32,7 @@ import os
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import Iterator
 
 __all__ = ["LabelEvent", "Chart", "ChartEntry", "LabelSet", "open_labelset", "parse_jsonl"]
 

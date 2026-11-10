@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from .actions import Commit, Timeline
+from .actions import Timeline
 from .injector import Injector
 
 __all__ = ["TimingSample", "TimingStats", "TimelineRunner"]

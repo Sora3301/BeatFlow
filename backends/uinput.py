@@ -29,13 +29,17 @@ surface is under ``(x, y)``. Two consequences:
 from __future__ import annotations
 
 import ctypes
-import fcntl
 import glob
 import os
 import struct
 import time
 
-from .base import TRACKING_NONE, BackendUnavailable, TouchBackend
+try:  # Linux-only. Importing the package must still work on macOS/Windows so
+    import fcntl  # the pure-logic half (labels/actions/geometry/visualizer) stays testable.
+except ImportError:  # pragma: no cover - non-Linux development machines
+    fcntl = None  # type: ignore[assignment]
+
+from .base import BackendUnavailable, TouchBackend
 
 __all__ = ["UinputBackend"]
 
@@ -153,6 +157,10 @@ class UinputBackend(TouchBackend):
     def open(self) -> None:
         if self._fd is not None:
             return
+        if fcntl is None:  # pragma: no cover - non-Linux host
+            raise BackendUnavailable(
+                "the uinput backend needs Linux; use --backend dryrun on this host"
+            )
         if not os.path.exists(self.device_path):
             raise BackendUnavailable(f"{self.device_path} does not exist")
         try:

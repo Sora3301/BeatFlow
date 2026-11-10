@@ -11,8 +11,17 @@ python3 -m beatflow_input probe                    # 检查 /dev/uinput
 python3 -m beatflow_input plan  --chart "Glitch"   # 看编译出的动作时间线
 python3 -m beatflow_input replay --chart "Glitch" --backend dryrun
 python3 -m beatflow_input replay --chart "Glitch" --backend uinput
+python3 -m beatflow_input watch  --chart "Glitch" --viz tk   # 4 指可视化（§10）
 python3 -m unittest discover -s beatflow_input/tests -t .
 ```
+
+> 包名就是目录名：`-m beatflow_input` 要求 checkout 目录叫 `beatflow_input`。
+> clone 成别的名字时（比如 `BeatFlow`），在上级目录加一个软链再跑测试即可：
+>
+> ```bash
+> ln -sfn "$(basename "$PWD")" ../beatflow_input && cd .. && \
+>   python3 -m unittest discover -s beatflow_input/tests -t .
+> ```
 
 ---
 
@@ -214,12 +223,81 @@ frame 624→678，y: 0.059→0.375）。两种解释：
 | `injector.py` | op → 槽位 + 坐标 → 设备 |
 | `scheduler.py` | 绝对 deadline 播放 + 延迟统计 |
 | `model_api.py` | 模型输出契约 + 适配器 |
-| `cli.py` | `probe / list / plan / replay / selftest` |
-| `tests/` | 31 个用例，含真实 `/dev/uinput`（无设备时自动 skip） |
+| `cli.py` | `probe / list / plan / replay / watch / selftest` |
+| `visualizer/` | **插件**：4 指实时可视化。`protocol.py` 管道协议、`scene.py` 特效引擎、`terminal.py` / `tkview.py` 两个渲染器、`live.py` 生产端 |
+| `docs/` | 效果示意图 + 生成脚本（`docs/` 里的脚本需要 Pillow，包本身仍然零依赖） |
+| `tests/` | 58 个用例，含真实 `/dev/uinput`（无设备时自动 skip） |
 
 ---
 
-## 10. 下一步
+## 10. 可视化插件（4 指实时预览）
+
+`visualizer/` 回答一个问题：**注入层此刻认为哪几根手指按在哪里？**
+颜色 = 手指（物理槽位），形状与运动 = 标签相位。
+
+| 相位 | 视觉 | 想表达 |
+|---|---|---|
+| `down` | 白色高亮核心 + 快速衰减的实心闪光 + 双层扩散圆环 + 径向火花 | 一次**撞击**，约 0.25 s 内消失 |
+| `hold` | 呼吸光晕（半径随时间脉动）+ 旋转圆弧 + 向下定位杆 + 持续上飘的余烬 | 一个**持续状态**，永远不"结束" |
+| `flick` | 沿滑动方向的彗尾（6 段渐隐）+ 三角箭头 + 锥形火花 | 一次**位移**，不是撞击 |
+
+![四指三种特效](docs/visualizer-effects.png)
+
+> 图是离线栅格化的文档示意（`docs/make_effects_preview.py`），绘制数学与
+> `tkview.py` 一致，便于放进 PPT。
+
+```bash
+# 不需要谱面、不需要设备，先看效果（最快的一条路）
+python3 -m beatflow_input.visualizer.terminal --demo
+python3 -m beatflow_input.visualizer.tkview --demo
+
+# 接真实谱面：默认 dryrun，不碰内核
+python3 -m beatflow_input watch --chart "Glitch" --viz tk
+python3 -m beatflow_input watch --chart "Glitch" --viz terminal   # SSH / 无 GUI 也成立
+
+# 真机演示：窗口 + 真实 uinput 注入同时进行
+python3 -m beatflow_input watch --chart "Glitch" --viz tk --backend uinput
+```
+
+`watch` 是 `replay` 的实时版本：它按墙钟播放，**不**因为可视化而改变注入时序
+（`--speed` 默认 1.0；想快进看特效可以调大，但那样看到的是压缩后的节奏）。
+
+### 为什么渲染器是独立进程
+
+父进程把状态写成 NDJSON 喂给子进程（`visualizer/protocol.py`）。两个理由：
+
+1. 注入循环按绝对 deadline 自旋，**不能让一次 60 fps 重绘挤进 16.7 ms 预算**；
+2. Tk 必须独占主线程，而 `TimelineRunner` 已经在用主线程。
+
+父进程每帧只付 `json.dumps` + 一次管道写。实测（SUPERNOVA，1577 commits，全程
+挂着 terminal 渲染器）：调度偏差 p50 **1.3 µs** / p99 79 µs，注入耗时 p50
+**53.7 µs** —— 渲染开销没有出现在注入数据里。子进程崩了（没有显示器、窗口被关）
+也只会静默停止，注入继续。
+
+### 帧是「状态」而不是「事件」
+
+每帧发的是「现在有哪些手指按着」，渲染器自己 diff 出按下/抬起/切换。
+这与 §2 的注入设计同一条原则：**丢一帧不会留下幽灵手指**。
+
+### 加一个新渲染器
+
+1. 写一个模块，`main()` 从 stdin 逐行读 NDJSON（`protocol.parse`），用
+   `scene.Scene` 驱动绘制；`Scene` 与渲染器无关，同样的 `down` 在终端和窗口里
+   语义一致，只有画笔不同；
+2. 在 `visualizer/live.py` 的 `RENDERERS` 里加一行。
+
+### 已知限制
+
+- **Wayland 下不能做「盖在游戏上的透明层」**：那需要 layer-shell 客户端，
+  不是标准库能做到的事。所以它是一个独立窗口/终端；全屏游戏时窗口会被
+  compositor 挡在后面，适合放在副屏，或者用 `--viz terminal` 在另一个终端看。
+- 特效的相位来自谱面标签（`phase_map`）。接模型输出时没有标签，渲染器会按
+  「存活时长 / 速度」推断（`auto`）：>0.12 s 判 hold，速度 >0.55 判 flick。
+  这时特效是**装饰性**的，不要拿它当相位正确性的证据。
+
+---
+
+## 11. 下一步
 
 1. **用真机 + 真游戏验证**（最高优先级）：在本机跑 Phira，`--backend uinput`
    点一遍，确认窗口能收到 touch、坐标不偏。这一步不需要模型。
