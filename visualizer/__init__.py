@@ -1,8 +1,8 @@
 """Live multi-touch visualizer plugins.
 
 The visualizer answers one question: *what does the agent think its fingers are
-doing right now?* It renders the contacts the injector actually holds, colour
-coded per finger, with a different effect for each label phase.
+doing right now?* It draws the contacts the injector actually holds: one
+pixel-art finger per contact, anchored on the beat point, colour coded per slot.
 
 Architecture (deliberate)
 -------------------------
@@ -22,7 +22,7 @@ Available renderers
     ANSI/truecolour, no GUI needed, works over SSH
     (:mod:`~beatflow_input.visualizer.terminal`).
 ``tk``
-    a real window with rings, particles and arcs
+    a real window with the four finger sprites
     (:mod:`~beatflow_input.visualizer.tkview`).
 
 Both can also be run standalone against a synthetic 4-finger routine::
@@ -41,12 +41,9 @@ from .scene import (
     JUDGMENT_LINE_Y,
     PALETTE,
     Contact,
-    Particle,
-    Ring,
     Scene,
     Viewport,
     finger_color,
-    phase_color,
 )
 
 __all__ = [
@@ -60,14 +57,11 @@ __all__ = [
     "LiveModel",
     "PALETTE",
     "PROTOCOL_VERSION",
-    "Particle",
     "RenderProcess",
-    "Ring",
     "Scene",
     "Streamer",
     "Viewport",
     "finger_color",
-    "phase_color",
     "phase_map",
     "available",
 ]

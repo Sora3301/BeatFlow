@@ -33,6 +33,7 @@ guesses, not facts:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal, Mapping, Sequence
 
@@ -44,6 +45,8 @@ __all__ = [
     "Timeline",
     "InterpreterConfig",
     "build_timeline",
+    "diff_ops",
+    "flick_offset",
     "JUDGMENT_LINE_Y",
 ]
 
@@ -146,11 +149,17 @@ class _Contact:
     move_to: tuple[float, float] | None = None
 
 
-def _diff(
+def diff_ops(
     prev: Mapping[int, tuple[float, float, int]],
     cur: Mapping[int, tuple[float, float, int]],
     ops: list[Op],
 ) -> None:
+    """Turn two contact snapshots into press / move / release ops.
+
+    Public because the real-time model path
+    (:class:`beatflow_input.model_api.ModelStream`) must produce *identical*
+    ops to the offline path; sharing this function is what keeps them honest.
+    """
     for key in prev:
         if key not in cur:
             ops.append(Op("release", key))
@@ -163,6 +172,29 @@ def _diff(
             ops.append(Op("press", key, x, y))
         elif (old[0], old[1]) != (x, y):
             ops.append(Op("move", key, x, y))
+
+
+
+def flick_offset(
+    direction: tuple[float, float] | None,
+    cfg: InterpreterConfig,
+) -> tuple[float, float]:
+    """Displacement for one flick.
+
+    A predicted or labelled direction is normalised so that every flick swipes
+    the same distance (``|cfg.flick_delta|``); only the heading changes. With
+    no direction at all we fall back to ``cfg.flick_delta`` - the same guess the
+    dataset path makes, because the label set has no flick heading either.
+    """
+    base_x, base_y = cfg.flick_delta
+    length = math.hypot(base_x, base_y)
+    if direction is None:
+        return (base_x, base_y)
+    dx, dy = float(direction[0]), float(direction[1])
+    norm = math.hypot(dx, dy)
+    if norm < 1e-6:
+        return (base_x, base_y)
+    return (dx / norm * length, dy / norm * length)
 
 
 def build_timeline(chart: Chart, cfg: InterpreterConfig | None = None) -> Timeline:
@@ -210,7 +242,7 @@ def build_timeline(chart: Chart, cfg: InterpreterConfig | None = None) -> Timeli
             elif e.phase == "flick":
                 prev = contacts.get(e.id)
                 epoch = 1 if prev is None else prev.epoch + 1
-                dx, dy = cfg.flick_delta
+                dx, dy = flick_offset(e.direction, cfg)
                 contacts[e.id] = _Contact(
                     e.x,
                     e.y,
@@ -233,7 +265,7 @@ def build_timeline(chart: Chart, cfg: InterpreterConfig | None = None) -> Timeli
         cur = {k: (c.x, c.y, c.epoch) for k, c in contacts.items()}
         if cur != state:
             ops: list[Op] = []
-            _diff(state, cur, ops)
+            diff_ops(state, cur, ops)
             if ops:
                 commits.append(
                     Commit(frame=frame, t=frame / cfg.fps + cfg.time_offset, ops=tuple(ops))

@@ -15,14 +15,6 @@ python3 -m beatflow_input watch  --chart "Glitch" --viz tk   # 4 指可视化（
 python3 -m unittest discover -s beatflow_input/tests -t .
 ```
 
-> 包名就是目录名：`-m beatflow_input` 要求 checkout 目录叫 `beatflow_input`。
-> clone 成别的名字时（比如 `BeatFlow`），在上级目录加一个软链再跑测试即可：
->
-> ```bash
-> ln -sfn "$(basename "$PWD")" ../beatflow_input && cd .. && \
->   python3 -m unittest discover -s beatflow_input/tests -t .
-> ```
-
 ---
 
 ## 1. 一句话结论（相对交接文档的变化）
@@ -76,25 +68,66 @@ map-set-labels/*.jsonl          （或模型逐帧输出）
 
 ## 3. 和模型侧的接口契约
 
-`model_api.py`，是给另外两位同学对接用的部分：
+`model_api.py` + `tracking.py`，是给另外两位同学对接用的部分。
+**模型只输出「我看到了什么」——坐标 + 类型，没有 id。** 身份由这一层自己分配。
 
 ```python
-# 每帧（60 Hz）输出一个列表，空列表 = 该帧没有任何手指
-[PredictedContact(id=0, x=-0.40, y=0.375),
- PredictedContact(id=1, x= 0.42, y=0.375)]
+# 每帧（60 Hz）输出一个列表；空列表 = 该帧没有任何手指
+[RawContact(x=-0.40, y=0.375, kind="tap"),
+ RawContact(x= 0.42, y=0.375, kind="flick", direction=(0.9, 0.4)),   # direction 可选
+ RawContact(x=-0.10, y=0.375, kind="hold")]
 ```
 
 | 约定 | 说明 |
 |---|---|
-| `x, y` | 游戏归一化坐标 `[-1, 1]`，与标签同一套；越界直接抛错（拒绝静默 clamp，方便抓模型跑飞） |
-| `id` | 按住期间必须稳定；同帧内不得重复。建议用单调自增整数 |
-| 生命周期 | 只出现 1 帧 → 自动变成 tap；连续 N 帧 → 变成 hold；按住期间位置变化 → 自动产生 move，游戏按 swipe 判定 flick |
+| `x, y` | 游戏归一化坐标 `[-1, 1]`，与标签同一套；越界**直接抛错**（拒绝静默 clamp，方便抓模型跑飞） |
+| `kind` | `tap` / `drag` / `hold` / `flick`；`down` 是 `tap` 的别名（标签就叫 `down`），大小写不敏感 |
+| `direction` | 只对 `flick` 有意义，`(dx, dy)` 走向，可为 `None` |
+| `id` | **不需要**。`ContactTracker` 用「速度外推的最近邻 + 距离门限」跨帧匹配，新触点拿单调自增 id，**id 永不复用** |
 | 空帧 | 允许且常见，成本为零（不产生 uinput 写入） |
 
+### 两种喂法
+
+实时（在线 agent 用这个）：
+
 ```python
-from beatflow_input import FramePrediction, PredictedContact, timeline_from_predictions
-tl = timeline_from_predictions([FramePrediction(0, (PredictedContact(0, -0.4, 0.375),))])
+from beatflow_input import ModelStream
+
+stream = ModelStream()                      # 内部自带 tracker + 生命周期状态机
+while running:
+    frame = capture()                       # 帧号单调递增
+    commit = stream.push(model(frame))      # 逐帧进，出来就是可注入的 Commit
+    injector.apply(commit)
 ```
+
+批量（测试、离线跑一份录下来的预测）：
+
+```python
+from beatflow_input import RawContact, predictions_from_raw, timeline_from_predictions
+
+frames = [(0, [RawContact(-0.4, 0.375, "tap")]), (1, []), (2, [])]
+timeline = timeline_from_predictions(predictions_from_raw(frames))
+```
+
+**这两条路径由测试绑死**：`tests/test_model_api.py::ParityTests` 对同一串输入
+断言两边逐 op 逐帧完全一致（tap / hold / 丢帧 / 移动 / flick / 双指 / tap→flick）。
+改任何一边而另一边没跟上，测试直接红。
+
+### 每种 kind 怎么变成触控事件
+
+| kind | 行为 |
+|---|---|
+| `tap` / `drag` | 出现时 press，`tap_frames` 后 release；如果连续多帧都在，视为模型改判或这是 hold，升级成 hold |
+| `hold` | press，最后一次被看到之后再保 `hold_grace_frames` 帧才 release |
+| `flick` | press → **下一帧由本层调度一次 move**（这次位移才是游戏眼里的 swipe）→ `flick_frames` 后 release |
+
+`flick` 的关键点：标签和模型输出里 flick 都只是**一个点**，没有位移。如果只是
+press 完就 release，游戏看到的是 tap 而不是 flick。所以位移是这一层合成的：
+
+- 模型给了 `direction` → 用它的方向，长度归一化到配置的 flick 距离；
+- 没给 → 回落到 `InterpreterConfig.flick_delta`（默认正上方），
+  和数据集回放是同一个猜测（见 §7）；
+- 同一个 flick 被连续报多帧 → **只触发一次**，重复 press 会被游戏当成双击。
 
 数据集回放走的是**同一条** `build_timeline` 路径，所以回放里修好的 bug 在线
 agent 上自动也是修好的。
@@ -115,6 +148,10 @@ agent 上自动也是修好的。
 | flick 形态 | press → 下一帧 move → 2 帧后 release | 游戏靠位移判 swipe | **方向不在数据里**，默认 `(0, +0.20)`，需视频验证 |
 | hold 结束 | id 停止出现后再留 2 帧 | 真实抬手帧未知 | 低 |
 | hold 期间位置 | `pinned`：冻结在按下点 | 记录的 y 单调爬升（0.059→0.375）是**音符**在动，不是手指 | 中，见 §7 |
+
+数据集这边 flick **方向永远缺失**（标签只有一个点），所以只能取默认值。
+接模型输出时如果模型能给出 `direction`，就用它的方向、长度归一化到
+`|flick_delta|`——这是目前唯一能拿到真实 swipe 方向的路子。
 
 `hold_tracking` 三档：`pinned`（默认，物理正确）/ `follow`（跟随记录坐标，
 模型输出用这档）/ `judgment_line`（把 y 钉在 0.375 判定线）。
@@ -222,29 +259,63 @@ frame 624→678，y: 0.059→0.375）。两种解释：
 | `actions.py` | 标签 → 逐帧接触集合 → press/move/release |
 | `injector.py` | op → 槽位 + 坐标 → 设备 |
 | `scheduler.py` | 绝对 deadline 播放 + 延迟统计 |
-| `model_api.py` | 模型输出契约 + 适配器 |
+| `model_api.py` | 模型输出契约：`RawContact`（无 id）、`ModelStream`（实时）、批量适配 |
+| `tracking.py` | **无 id 检测 → 稳定触点 id**：最近邻 + 速度外推 + 距离门限，id 永不复用 |
 | `cli.py` | `probe / list / plan / replay / watch / selftest` |
-| `visualizer/` | **插件**：4 指实时可视化。`protocol.py` 管道协议、`scene.py` 特效引擎、`terminal.py` / `tkview.py` 两个渲染器、`live.py` 生产端 |
-| `docs/` | 效果示意图 + 生成脚本（`docs/` 里的脚本需要 Pillow，包本身仍然零依赖） |
-| `tests/` | 58 个用例，含真实 `/dev/uinput`（无设备时自动 skip） |
+| `visualizer/` | **插件**：4 指实时可视化。`protocol.py` 管道协议、`scene.py` 触点状态机、`terminal.py` / `tkview.py` 两个渲染器、`live.py` 生产端 |
+| `visualizer/assets/` | 四张 16×16 像素画手指贴图 + `sprites.json`（尺寸 / beat point / 主色） |
+| `docs/` | 效果示意图、贴图生成脚本、示意图生成脚本（`docs/` 里的脚本需要 Pillow，包本身仍然零依赖） |
+| `tests/` | 95 个用例，含真实 `/dev/uinput`（无设备时自动 skip） |
 
 ---
 
 ## 10. 可视化插件（4 指实时预览）
 
 `visualizer/` 回答一个问题：**注入层此刻认为哪几根手指按在哪里？**
-颜色 = 手指（物理槽位），形状与运动 = 标签相位。
+每根手指就是一张**像素画小鱼**，压在它真正触碰的位置上，没有别的装饰。
 
-| 相位 | 视觉 | 想表达 |
+> 早期版本有圆环、火花、彗尾、光晕等特效层，现已**全部删除**：贴图本身就是
+> 全部画面。`Scene` 只保留「哪些手指按着 / 按了多久 / 相位是什么」，
+> 相位只用于 HUD 计数与终端里的字形区分。
+
+| 相位 | 终端字形 | 说明 |
 |---|---|---|
-| `down` | 白色高亮核心 + 快速衰减的实心闪光 + 双层扩散圆环 + 径向火花 | 一次**撞击**，约 0.25 s 内消失 |
-| `hold` | 呼吸光晕（半径随时间脉动）+ 旋转圆弧 + 向下定位杆 + 持续上飘的余烬 | 一个**持续状态**，永远不"结束" |
-| `flick` | 沿滑动方向的彗尾（6 段渐隐）+ 三角箭头 + 锥形火花 | 一次**位移**，不是撞击 |
+| `down` | `●` | 刚按下 |
+| `hold` | `◉` | 按住中（标签给的 `hold`，或存活超过 120 ms 的推断） |
+| `flick` | `✦` | 划动（标签给的 `flick`，或速度超过 0.55 单位/s 的推断） |
 
-![四指三种特效](docs/visualizer-effects.png)
+![四指](docs/visualizer-preview.png)
 
-> 图是离线栅格化的文档示意（`docs/make_effects_preview.py`），绘制数学与
-> `tkview.py` 一致，便于放进 PPT。
+> 图是离线栅格化的文档示意（`docs/make_preview.py`），贴图锚点与
+> `tkview.py` 完全一致，便于放进 PPT。
+
+### 四张贴图与「beat point」
+
+`visualizer/assets/finger0..3.png` 是四张 16×16 像素画（每条鱼一色），
+`sprites.json` 记录每张的尺寸、**head 单元格**坐标和主色。
+**beat point = 鱼头右上角**：绘制时把 head 单元格的右上角顶到触点上，
+鱼身与拖尾自然伸向左下方，正对判定线下压的方向。
+
+```python
+# Origin that puts the head's top-right corner on the contact point
+x = cx - (head_x + 1) * zoom      # right edge of the head cell == cx
+y = cy - head_y * zoom            # top edge of the head cell == cy
+```
+
+`--sprite-zoom`（默认 5）是整数放大倍数：16 px 的图 → 80 px。
+用整数倍是为了保住像素画的硬边，**不要**用双线性缩放。
+
+重新生成贴图（需要 Pillow，包本身仍然零依赖）：
+
+```bash
+python docs/make_sprites.py 原图1.png 原图2.png 原图3.png 原图4.png
+```
+
+脚本会把 1024×1024 的原图按 64 px 一格采样回 16×16、裁到不透明包围盒、
+补上 alpha（第 4 张原图没有透明通道，用从边框泛洪去背），并写出 `sprites.json`。
+
+> 终端渲染器画不了位图，用的是字符图形（`● ◉ ✦`），颜色仍按手指取
+> `PALETTE`——那四个值就是从贴图里算出来的主色，所以两个渲染器的配色是一致的。
 
 ```bash
 # 不需要谱面、不需要设备，先看效果（最快的一条路）
@@ -260,7 +331,7 @@ python3 -m beatflow_input watch --chart "Glitch" --viz tk --backend uinput
 ```
 
 `watch` 是 `replay` 的实时版本：它按墙钟播放，**不**因为可视化而改变注入时序
-（`--speed` 默认 1.0；想快进看特效可以调大，但那样看到的是压缩后的节奏）。
+（`--speed` 默认 1.0；想快进可以调大，但那样看到的是压缩后的节奏）。
 
 ### 为什么渲染器是独立进程
 
@@ -291,9 +362,9 @@ python3 -m beatflow_input watch --chart "Glitch" --viz tk --backend uinput
 - **Wayland 下不能做「盖在游戏上的透明层」**：那需要 layer-shell 客户端，
   不是标准库能做到的事。所以它是一个独立窗口/终端；全屏游戏时窗口会被
   compositor 挡在后面，适合放在副屏，或者用 `--viz terminal` 在另一个终端看。
-- 特效的相位来自谱面标签（`phase_map`）。接模型输出时没有标签，渲染器会按
+- 相位来自谱面标签（`phase_map`）。接模型输出时没有标签，渲染器会按
   「存活时长 / 速度」推断（`auto`）：>0.12 s 判 hold，速度 >0.55 判 flick。
-  这时特效是**装饰性**的，不要拿它当相位正确性的证据。
+  推断只影响 HUD 计数和终端字形，**不要**拿它当相位正确性的证据。
 
 ---
 

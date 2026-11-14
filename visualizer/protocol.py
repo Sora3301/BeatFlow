@@ -15,8 +15,8 @@ The parent therefore only ever pays for ``json.dumps`` plus one pipe write per
 frame, which is tens of microseconds.
 
 Frames are *state*, not events: the renderer diffs consecutive ``contacts``
-lists to spawn effects, so a dropped or coalesced frame can never leave a ghost
-finger on screen.
+lists to detect presses and releases, so a dropped or coalesced frame can never
+leave a ghost finger on screen.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ __all__ = [
 #: instead of drawing nonsense.
 PROTOCOL_VERSION = 1
 
-#: ``auto`` means "no label phase available" - the renderer infers the effect
+#: ``auto`` means "no label phase available" - the renderer infers the phase
 #: from lifetime and velocity (that is the only option for model predictions).
 PHASES = ("down", "hold", "flick", "auto")
 

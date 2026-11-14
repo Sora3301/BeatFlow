@@ -5,7 +5,7 @@ Run it directly (it reads NDJSON frames on stdin, written by
 
     python3 -m beatflow_input watch --chart "Glitch" --viz terminal
 
-or watch the built-in demo, which is the quickest way to see the three effects
+or watch the built-in demo, which is the quickest way to see the three phases
 without a chart or a device::
 
     python3 -m beatflow_input.visualizer.terminal --demo
@@ -17,7 +17,6 @@ so what you learn to read here transfers to ``--viz tk``.
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import shutil
 import sys
@@ -35,10 +34,6 @@ GLYPHS_UNICODE = {
     "contact_down": "●",
     "contact_hold": "◉",
     "contact_flick": "✦",
-    "ring_thin": "·",
-    "ring": "○",
-    "spark": "·",
-    "spark_bright": "✧",
     "line": "─",
     "lane": "┊",
     "cross": "┼",
@@ -47,10 +42,6 @@ GLYPHS_ASCII = {
     "contact_down": "o",
     "contact_hold": "@",
     "contact_flick": "*",
-    "ring_thin": ".",
-    "ring": ".",
-    "spark": ".",
-    "spark_bright": "+",
     "line": "-",
     "lane": "|",
     "cross": "+",
@@ -151,22 +142,6 @@ class TerminalCanvas:
     def put_world(self, x: float, y: float, ch: str, color) -> None:
         self.put(*self.project(x, y), ch, color)
 
-    def ring(self, cx: float, cy: float, radius: float, color, ch: str, alpha: float = 1.0) -> None:
-        if radius <= 0.004:
-            self.put_world(cx, cy, ch, color)
-            return
-        # enough samples that the ring stays visually connected
-        samples = max(16, min(240, int(radius * 90)))
-        shade = _scale(color, 0.35 + 0.65 * max(0.0, min(1.0, alpha)) ** 0.6)
-        for i in range(samples):
-            a = math.tau * i / samples
-            self.put_world(cx + math.cos(a) * radius, cy + math.sin(a) * radius, ch, shade)
-
-    def vertical(self, col: int, row_from: int, row_to: int, ch: str, color) -> None:
-        lo, hi = (row_from, row_to) if row_from <= row_to else (row_to, row_from)
-        for r in range(max(0, lo), min(self.h, hi + 1)):
-            self.put(col, r, ch, color)
-
     # -- output ------------------------------------------------------------
     def to_text(self, use_color: bool = True) -> str:
         out: list[str] = []
@@ -187,7 +162,7 @@ class TerminalCanvas:
         return "\n".join(out)
 
 
-def render_frame(scene: Scene, canvas: TerminalCanvas, *, now: float) -> None:
+def render_frame(scene: Scene, canvas: TerminalCanvas) -> None:
     """Draw ``scene`` into ``canvas`` (no stdout side effects)."""
     g = canvas.glyphs
     line_y = scene.judgement_line_y
@@ -200,38 +175,9 @@ def render_frame(scene: Scene, canvas: TerminalCanvas, *, now: float) -> None:
     for lane in (-0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6):
         canvas.put(canvas.project(lane, line_y)[0], max(0, line_row - 1), g["lane"], _scale(DIM, 0.55))
 
-    # 2. rings (behind the fingers) --------------------------------------
-    for ring in scene.rings:
-        ch = g["ring"] if ring.width >= 1.5 else g["ring_thin"]
-        canvas.ring(ring.x, ring.y, ring.radius(now), ring.color, ch, ring.alpha(now))
-
-    # 3. particles -------------------------------------------------------
-    for p in scene.particles:
-        px, py = p.position(now)
-        life = 1.0 - p.progress(now)
-        ch = g["spark_bright"] if p.size > 1.0 else g["spark"]
-        canvas.put_world(px, py, ch, _scale(p.color, 0.2 + 0.8 * life))
-
-    # 4. a held finger gets a short stem so it reads as "planted" ---------
+    # 2. the fingers themselves -----------------------------------------
     for c in scene.contacts:
-        if c.phase == "hold":
-            col, row = canvas.project(c.x, c.y)
-            canvas.vertical(col, row, row + 2, g["lane"], _scale(c.effect_color, 0.5))
-
-    # 5. the fingers themselves -----------------------------------------
-    for c in scene.contacts:
-        pulse = 1.0 + (0.25 * math.sin(now * math.tau * 3.0) if c.phase == "hold" else 0.0)
-        canvas.put_world(c.x, c.y, g[f"contact_{c.phase}"], _scale(c.effect_color, pulse))
-        if c.phase == "hold":
-            radius = 0.055 + 0.018 * math.sin(now * math.tau * 2.2)
-            canvas.ring(c.x, c.y, radius, c.effect_color, g["ring_thin"], 0.75)
-        elif c.phase == "flick":
-            dx, dy = c.direction()
-            for step in range(1, 4):
-                canvas.put_world(
-                    c.x - dx * 0.05 * step, c.y - dy * 0.05 * step,
-                    g["spark"], _scale(c.effect_color, 0.6 - 0.15 * step),
-                )
+        canvas.put_world(c.x, c.y, g[f"contact_{c.phase}"], c.color)
 
 
 def build_screen(
@@ -248,7 +194,7 @@ def build_screen(
     """Compose the full screen: HUD row, play field, legend row."""
     viewport = Viewport.for_grid(width, height)
     canvas = TerminalCanvas(width, height, viewport, glyphs)
-    render_frame(scene, canvas, now=now)
+    render_frame(scene, canvas)
 
     counts = scene.phase_counts()
     clock = f"{now:6.2f}s" + (f" / {duration:.1f}s" if duration else "")
@@ -272,7 +218,7 @@ def build_screen(
 
 
 def demo_frames(duration: float = 8.0, fps: float = 60.0) -> Iterator[FrameState]:
-    """A synthetic 4-finger routine that exercises all three effects.
+    """A synthetic 4-finger routine that exercises all three phases.
 
     Shape-identical to real traffic (``FrameState`` in, renderer out), so the
     demo cannot drift away from what ``watch`` sends. Finger 1 holds, finger 2
@@ -372,7 +318,7 @@ def _run_stream(
     return 0
 
 
-def _stdin_frames(meta: dict):
+def _stdin_frames(meta: MutableMapping[str, str]) -> Iterator[FrameState]:
     """Blocking NDJSON reader; ends when the producer closes stdin."""
     for line in sys.stdin:
         line = line.strip()

@@ -1,0 +1,62 @@
+[
+  {
+    "slot": 0,
+    "file": "finger0.png",
+    "width": 15,
+    "height": 15,
+    "head": [
+      14,
+      4
+    ],
+    "accent": [
+      130,
+      181,
+      170
+    ]
+  },
+  {
+    "slot": 1,
+    "file": "finger1.png",
+    "width": 14,
+    "height": 14,
+    "head": [
+      13,
+      4
+    ],
+    "accent": [
+      152,
+      167,
+      186
+    ]
+  },
+  {
+    "slot": 2,
+    "file": "finger2.png",
+    "width": 16,
+    "height": 16,
+    "head": [
+      15,
+      0
+    ],
+    "accent": [
+      51,
+      236,
+      203
+    ]
+  },
+  {
+    "slot": 3,
+    "file": "finger3.png",
+    "width": 16,
+    "height": 16,
+    "head": [
+      15,
+      0
+    ],
+    "accent": [
+      170,
+      157,
+      189
+    ]
+  }
+]

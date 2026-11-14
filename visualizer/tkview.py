@@ -9,35 +9,41 @@ injection. Frames arrive as NDJSON on stdin; the window only ever reads them.
 
 Design notes
 ------------
-* Tk canvas has no alpha, so every fading effect blends towards the background
+* Tk canvas has no alpha, so the fallback dot blends towards the background
   colour explicitly. The background is a vertical gradient, so blending uses the
   colour local to the item's row.
 * Items are drawn into one of two alternating tags and the *other* tag is
   deleted afterwards, which avoids the full-canvas flicker of ``delete("all")``
   while keeping the draw code stateless.
 * The clock is interpolated from the wall clock between frames, so a stalled
-  producer freezes the fingers but not the particles.
+  producer freezes the fingers instead of letting them drift.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
+import json
 import queue
 import sys
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 from .protocol import FrameState, parse
 from .scene import JUDGMENT_LINE_Y, PALETTE, Contact, Scene, Viewport
 
-__all__ = ["TkRenderer", "main"]
+__all__ = ["TkRenderer", "SpriteSet", "main"]
 
 BG_TOP = (11, 15, 20)
 BG_BOTTOM = (5, 7, 11)
 LINE_COLOR = (120, 220, 255)
 GRID_COLOR = (28, 38, 50)
 TEXT_COLOR = (150, 168, 190)
+
+#: 16x16 pixel-art fish, one per finger, drawn with their "beat point" (the
+#: top-right cell of the head) exactly on the contact coordinate.
+ASSETS = Path(__file__).resolve().parent / "assets"
 
 
 def _blend(fg: tuple[int, int, int], bg: tuple[int, int, int], alpha: float) -> str:
@@ -53,12 +59,85 @@ def _hex(color: tuple[int, int, int]) -> str:
     return "#%02x%02x%02x" % color
 
 
+@dataclass
+class Sprite:
+    """One loaded finger sprite plus where its beat point sits inside it."""
+
+    image: object          # tk.PhotoImage, already zoomed
+    width: int             # art pixels
+    height: int
+    head_x: int            # beat cell, in art pixels
+    head_y: int
+    zoom: int
+
+    def origin(self, cx: float, cy: float) -> tuple[float, float]:
+        """Top-left corner that puts the beat point on ``(cx, cy)``.
+
+        The beat point is the **top-right corner of the head cell**: the fish
+        swims up-right with its trail behind it, so the tip of the head is where
+        the finger actually touches. Anchoring the image's own corner would put
+        the visible tip a few pixels left of the touch.
+        """
+        return (cx - (self.head_x + 1) * self.zoom, cy - self.head_y * self.zoom)
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return (self.width * self.zoom, self.height * self.zoom)
+
+
+class SpriteSet:
+    """The four finger sprites, loaded once and reused every frame."""
+
+    def __init__(self, tk, zoom: int = 5, directory: Path | None = None) -> None:
+        self.zoom = max(1, int(zoom))
+        self.sprites: list[Sprite] = []
+        self.error: str | None = None
+        self._load(tk, directory or ASSETS)
+
+    def _load(self, tk, directory: Path) -> None:
+        manifest = directory / "sprites.json"
+        if not manifest.exists():
+            self.error = f"{manifest} not found"
+            return
+        try:
+            entries = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.error = f"cannot read {manifest}: {exc}"
+            return
+        try:
+            for entry in sorted(entries, key=lambda e: e.get("slot", 0)):
+                base = tk.PhotoImage(file=str(directory / entry["file"]))
+                image = base.zoom(self.zoom) if self.zoom > 1 else base
+                self.sprites.append(
+                    Sprite(
+                        image=image,
+                        width=int(entry.get("width", base.width())),
+                        height=int(entry.get("height", base.height())),
+                        head_x=int(entry["head"][0]),
+                        head_y=int(entry["head"][1]),
+                        zoom=self.zoom,
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 - Tk raises bare TclError
+            self.sprites = []
+            self.error = f"cannot load sprites: {exc}"
+
+    def for_contact(self, contact: Contact) -> Sprite | None:
+        if not self.sprites:
+            return None
+        index = contact.slot if contact.slot >= 0 else contact.key
+        return self.sprites[index % len(self.sprites)]
+
+    def __bool__(self) -> bool:
+        return bool(self.sprites)
+
+
 class TkRenderer:
     """Owns the window, the item pool and the frame clock."""
 
     def __init__(self, width: int = 1100, height: int = 660, fps: float = 60.0,
                  title: str = "BeatFlow - virtual input", demo_seconds: float = 0.0,
-                 max_frames: int = 0) -> None:
+                 sprite_zoom: int = 5, max_frames: int = 0) -> None:
         import tkinter as tk  # imported here so --help works without a display
 
         self.tk = tk
@@ -88,6 +167,10 @@ class TkRenderer:
         self._frames = 0
         self._max_frames = max(0, max_frames)
         self._demo = demo_seconds > 0.0
+
+        self.sprites = SpriteSet(tk, zoom=sprite_zoom)
+        if self.sprites.error:
+            print(f"visualizer: {self.sprites.error}; drawing dots instead", file=sys.stderr)
 
         self._build_background()
 
@@ -181,77 +264,19 @@ class TkRenderer:
         return latest
 
     # -- drawing -----------------------------------------------------------
-    def _draw_rings(self, tag: str, now: float) -> None:
-        for ring in self.scene.rings:
-            cx, cy = self._point(ring.x, ring.y)
-            r = self._px(ring.radius(now))
-            if r < 0.5:
-                continue
-            bg = self._bg_at(cy)
-            if ring.filled:
-                # soft impact flash: fades quickly, no outline
-                alpha = ring.alpha(now) ** 1.6
-                self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                        fill=_blend(ring.color, bg, 0.15 + 0.85 * alpha),
-                                        outline="", tag=tag)
-                continue
-            color = _blend(ring.color, bg, 0.30 + 0.70 * ring.alpha(now) ** 0.6)
-            width = max(1.5, ring.width * self.width / 700.0)
-            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                    outline=color, width=width, tag=tag)
-
-    def _draw_particles(self, tag: str, now: float) -> None:
-        for p in self.scene.particles:
-            x, y = p.position(now)
-            cx, cy = self._point(x, y)
-            r = max(0.9, 1.2 * p.size * (1.0 - 0.5 * p.progress(now)))
-            bg = self._bg_at(cy)
-            color = _blend(p.color, bg, 0.18 + 0.82 * (1.0 - p.progress(now)))
-            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                    fill=color, outline="", tag=tag)
-
-    def _draw_contact(self, tag: str, c: Contact, now: float) -> None:
+    def _draw_contact(self, tag: str, c: Contact) -> None:
+        """Draw one finger: its sprite, or a plain dot if the assets are gone."""
         cx, cy = self._point(c.x, c.y)
-        bg = self._bg_at(cy)
-        base = c.effect_color
 
-        if c.phase == "hold":
-            # breathing halo + a rotating arc: unmistakably "still down"
-            pulse = 2.0 * math.sin(now * math.tau * 2.2)
-            r = self._px(0.052) + pulse
-            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                    outline=_blend(base, bg, 0.85), width=2, tag=tag)
-            arc_r = self._px(0.085)
-            self.canvas.create_arc(
-                cx - arc_r, cy - arc_r, cx + arc_r, cy + arc_r,
-                start=(now * 220.0) % 360.0, extent=70.0, style="arc",
-                outline=_blend(base, bg, 0.95), width=3, tag=tag,
-            )
-            self.canvas.create_line(cx, cy, cx, cy + self._px(0.05),
-                                    fill=_blend(base, bg, 0.55), width=1, tag=tag)
-
-        if c.phase == "flick":
-            dx, dy = c.direction()
-            # screen y grows downwards, so the direction flips
-            sx, sy = dx, -dy
-            tail = self._px(0.16)
-            for i in range(1, 7):
-                t = i / 6.0
-                px, py = cx - sx * tail * t, cy - sy * tail * t
-                rr = max(1.0, 4.2 * (1.0 - t))
-                self.canvas.create_oval(px - rr, py - rr, px + rr, py + rr,
-                                        fill=_blend(base, bg, 0.75 * (1.0 - t) + 0.1),
-                                        outline="", tag=tag)
-            head = self._px(0.055)
-            self.canvas.create_polygon(
-                cx + sx * head, cy + sy * head,
-                cx - sx * head * 0.6 - sy * head * 0.8, cy - sy * head * 0.6 + sx * head * 0.8,
-                cx - sx * head * 0.6 + sy * head * 0.8, cy - sy * head * 0.6 - sx * head * 0.8,
-                fill=_blend(base, bg, 0.95), outline="", tag=tag,
-            )
+        sprite = self.sprites.for_contact(c)
+        if sprite is not None:
+            x, y = sprite.origin(cx, cy)
+            self.canvas.create_image(x, y, anchor="nw", image=sprite.image, tag=tag)
             return
 
-        # down: a compact dot with a white-hot core
+        # fallback (no sprite assets): a compact dot with a white-hot core
+        bg = self._bg_at(cy)
+        base = c.color
         r = self._px(0.020)
         self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
                                 fill=_blend(base, bg, 1.0), outline="", tag=tag)
@@ -275,10 +300,8 @@ class TkRenderer:
         self.scene.tick(now)
 
         tag = "fx_b" if self._tag == "fx_a" else "fx_a"
-        self._draw_rings(tag, now)
-        self._draw_particles(tag, now)
         for c in self.scene.contacts:
-            self._draw_contact(tag, c, now)
+            self._draw_contact(tag, c)
         self._update_hud(now)
 
         self.canvas.delete(self._tag)
@@ -354,6 +377,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--width", type=int, default=1100)
     p.add_argument("--height", type=int, default=660)
     p.add_argument("--title", default="BeatFlow - virtual input")
+    p.add_argument("--sprite-zoom", type=int, default=5,
+                   help="integer scale applied to the 16x16 finger sprites (default 5 = 80px)")
     p.add_argument("--frames", type=int, default=0, help="quit after N rendered frames (tests)")
     return p
 
@@ -363,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
     demo_seconds = args.demo_seconds or (8.0 if args.demo else 0.0)
     try:
         renderer = TkRenderer(args.width, args.height, args.fps, args.title, demo_seconds,
-                              max_frames=args.frames)
+                              sprite_zoom=args.sprite_zoom, max_frames=args.frames)
     except Exception as exc:  # pragma: no cover - depends on the host
         print(f"canvas visualizer unavailable: {exc}", file=sys.stderr)
         return 2

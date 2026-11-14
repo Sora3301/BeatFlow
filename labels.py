@@ -48,6 +48,10 @@ class LabelEvent:
     x: float
     y: float
     bad: bool = False
+    #: Swipe heading for a ``flick``, unit-ish ``(dx, dy)``. The label set never
+    #: carries one (a flick is a single point), so it stays ``None`` for dataset
+    #: replay and is only filled by model predictions that know the heading.
+    direction: tuple[float, float] | None = None
 
     @property
     def out_of_range(self) -> bool:

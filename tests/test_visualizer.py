@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import struct
 import unittest
+from types import SimpleNamespace
 
 from beatflow_input.labels import Chart, LabelEvent
 from beatflow_input.visualizer import (
@@ -14,7 +17,6 @@ from beatflow_input.visualizer import (
     Viewport,
     available,
     finger_color,
-    phase_color,
     phase_map,
 )
 from beatflow_input.visualizer.protocol import (
@@ -79,24 +81,20 @@ class ProtocolTests(unittest.TestCase):
 
 
 class SceneTests(unittest.TestCase):
-    def test_press_spawns_effect_and_release_stops_it(self):
+    def test_press_and_release(self):
         scene = Scene()
         scene.update(0.0, [ContactState(key=1, x=-0.3, y=0.375, phase="down", slot=0)])
         self.assertEqual(len(scene.contacts), 1)
-        self.assertGreaterEqual(len(scene.rings), 1)
-        self.assertGreaterEqual(len(scene.particles), 1)
-
+        self.assertEqual(scene.contacts[0].slot, 0)
         scene.update(0.05, [])
         self.assertEqual(len(scene.contacts), 0)
 
-    def test_effects_expire(self):
+    def test_scene_has_no_effect_state(self):
+        """Effects were removed on purpose; guard against them creeping back."""
         scene = Scene()
         scene.update(0.0, [ContactState(key=1, x=0.0, y=0.375, phase="down")])
-        # disappearing spawns the release ring, so let that one expire too
-        scene.update(1.5, [])
-        scene.tick(2.0)
-        self.assertEqual(len(scene.rings), 0)
-        self.assertEqual(len(scene.particles), 0)
+        self.assertFalse(hasattr(scene, "rings"))
+        self.assertFalse(hasattr(scene, "particles"))
 
     def test_label_phase_is_trusted(self):
         scene = Scene()
@@ -120,20 +118,18 @@ class SceneTests(unittest.TestCase):
     def test_join_mid_flight_keeps_age(self):
         scene = Scene()
         scene.update(5.0, [ContactState(key=1, x=0.0, y=0.375, phase="auto", age=0.5)])
-        # a renderer attached late must not replay the press animation
+        # a renderer attached late must not treat a long hold as a fresh tap
         self.assertEqual(scene.contacts[0].phase, "hold")
 
-    def test_colours_follow_the_finger_not_the_phase(self):
+    def test_colours_follow_the_finger(self):
         self.assertEqual(finger_color(0, 99), finger_color(0, 1))
         self.assertNotEqual(finger_color(0, 0), finger_color(1, 0))
-        self.assertNotEqual(phase_color("down", (200, 100, 50)),
-                            phase_color("flick", (200, 100, 50)))
 
-    def test_particle_cap(self):
+    def test_clock_never_goes_backwards(self):
         scene = Scene()
-        for i in range(200):
-            scene.update(i * 0.001, [ContactState(key=i, x=0.0, y=0.375, phase="flick")])
-        self.assertLessEqual(len(scene.particles), 700)
+        scene.tick(1.0)
+        scene.tick(0.5)
+        self.assertEqual(scene.now, 1.0)
 
 
 class ViewportTests(unittest.TestCase):
@@ -277,6 +273,63 @@ class CliTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             build_parser().parse_args(["watch", "--viz", "hologram"])
+
+
+class SpriteAssetTests(unittest.TestCase):
+    """The four pixel-art fingers and where their beat point sits."""
+
+    def setUp(self):
+        from beatflow_input.visualizer.tkview import ASSETS
+
+        self.assets = ASSETS
+        self.manifest = json.loads((ASSETS / "sprites.json").read_text(encoding="utf-8"))
+
+    def test_four_fingers(self):
+        self.assertEqual(len(self.manifest), 4)
+        self.assertEqual([e["slot"] for e in self.manifest], [0, 1, 2, 3])
+
+    def test_manifest_matches_the_pngs(self):
+        for entry in self.manifest:
+            data = (self.assets / entry["file"]).read_bytes()
+            self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n", entry["file"])
+            width, height = struct.unpack(">II", data[16:24])   # PNG IHDR
+            self.assertEqual((width, height), (entry["width"], entry["height"]))
+            hx, hy = entry["head"]
+            self.assertTrue(0 <= hx < width and 0 <= hy < height, entry["file"])
+
+    def test_origin_puts_the_beat_point_on_the_contact(self):
+        from beatflow_input.visualizer.tkview import Sprite
+
+        sprite = Sprite(image=None, width=15, height=15, head_x=14, head_y=4, zoom=5)
+        cx, cy = 192.0, 359.0
+        x, y = sprite.origin(cx, cy)
+        # the head cell's right edge and top edge both land on the contact
+        self.assertAlmostEqual(x + (14 + 1) * 5, cx)
+        self.assertAlmostEqual(y + 4 * 5, cy)
+
+    def test_origin_scales_with_zoom(self):
+        from beatflow_input.visualizer.tkview import Sprite
+
+        sprite = Sprite(image=None, width=16, height=16, head_x=15, head_y=0, zoom=1)
+        x, y = sprite.origin(100.0, 200.0)
+        self.assertAlmostEqual((x, y), (100.0 - 16, 200.0))
+
+    def test_sprite_follows_the_finger_not_the_phase(self):
+        from beatflow_input.visualizer.tkview import SpriteSet
+
+        sprites = SpriteSet.__new__(SpriteSet)
+        sprites.sprites = [None, None, None, None]
+        # slot wins when known, key is the fallback (same rule as the colour)
+        self.assertIsNone(sprites.for_contact(SimpleNamespace(slot=2, key=99)))
+        self.assertEqual(len(sprites.sprites), 4)
+
+    def test_empty_set_falls_back_to_dots(self):
+        from beatflow_input.visualizer.tkview import SpriteSet
+
+        sprites = SpriteSet.__new__(SpriteSet)
+        sprites.sprites = []
+        self.assertIsNone(sprites.for_contact(SimpleNamespace(slot=0, key=0)))
+        self.assertFalse(sprites)
 
 
 if __name__ == "__main__":
