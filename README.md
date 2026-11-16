@@ -13,6 +13,19 @@ python3 -m beatflow_input replay --chart "Glitch" --backend dryrun
 python3 -m beatflow_input replay --chart "Glitch" --backend uinput
 python3 -m beatflow_input watch  --chart "Glitch" --viz tk   # 4 指可视化（§10）
 python3 -m unittest discover -s beatflow_input/tests -t .
+python3 main.py demo                               # 主程序：内置序列跑通整条回路（§12）
+```
+
+仓库结构（两套代码，互不依赖）:
+
+```
+BeatFlow/
+├── beatflow_input/     # 注入层 = 本 README 描述的包，零依赖
+│   ├── ...             # 下文提到的包内路径都相对这个目录（docs/ 除外）
+│   └── tests/          # 95 个用例
+├── beatflow_main/      # 主程序：采集 → 模型 → 注入 的编排（§12）
+├── main.py             # 主程序入口
+└── docs/               # 文档资产脚本（需要 Pillow），仍在仓库根目录
 ```
 
 ---
@@ -291,8 +304,8 @@ frame 624→678，y: 0.059→0.375）。两种解释：
 
 ### 四张贴图与「beat point」
 
-`visualizer/assets/finger0..3.png` 是四张 16×16 像素画（每条鱼一色），
-`sprites.json` 记录每张的尺寸、**head 单元格**坐标和主色。
+`beatflow_input/visualizer/assets/finger0..3.png` 是四张 16×16 像素画（每条鱼一色），
+`beatflow_input/visualizer/assets/sprites.json` 记录每张的尺寸、**head 单元格**坐标和主色。
 **beat point = 鱼头右上角**：绘制时把 head 单元格的右上角顶到触点上，
 鱼身与拖尾自然伸向左下方，正对判定线下压的方向。
 
@@ -373,6 +386,122 @@ python3 -m beatflow_input watch --chart "Glitch" --viz tk --backend uinput
 1. **用真机 + 真游戏验证**（最高优先级）：在本机跑 Phira，`--backend uinput`
    点一遍，确认窗口能收到 touch、坐标不偏。这一步不需要模型。
 2. **视频叠加验证坐标语义**（§7）：拿到训练集后抽 1 帧，把标签点画上去。
-3. **端到端延迟测量**：加打点，量「帧捕获 → 推理 → 注入」总时长。
+3. **端到端延迟测量**：`main.py` 已经把采集 / 推理 / 合成 / 注入四段打点（§12）；
+   接上真实采集与真实模型后，量「帧捕获 → 推理 → 注入」总时长。
 4. 数据管线（重写 `Test.py`）—— 本机仍需先装 numpy/torch（Python 3.14 不支持
    PyTorch，得装 3.12 或 3.11 的解释器）。
+
+---
+
+## 12. 主程序：`main.py` + `beatflow_main/`
+
+注入层回答「给定每帧的手指位置，怎么变成内核事件」；主程序负责它前面的半段：
+
+```
+帧源 → 模型 → ModelStream → Injector → UinputBackend
+```
+
+M1 阶段两端都是替身，但**中间是真的**：帧源用合成空帧，模型用一份录好的预测，
+注入走真实的 `ModelStream` + `Injector` + `DryRunBackend`。这样在真模型和真采集
+到位之前，就能把时序、丢帧、释放、坐标这些接缝先压测掉。
+
+```bash
+python3 main.py demo                          # 内置序列，不需要任何数据
+python3 main.py demo --no-realtime --json     # 机器可读（最后一行是 JSON）
+python3 main.py demo --export preds.jsonl     # 把内置序列导出成录制格式
+python3 main.py run --recorded preds.jsonl    # 回放录好的预测
+python3 main.py run --recorded preds.jsonl --backend uinput --lead-in 3
+```
+
+### 录制的预测格式
+
+一行一个非空帧，缺的帧就是空帧：
+
+```jsonl
+{"frame": 40, "contacts": [{"x": -0.4, "y": 0.375, "kind": "tap"}]}
+{"frame": 41, "contacts": [{"x": -0.4, "y": 0.375, "kind": "flick", "direction": [0.9, 0.4]}]}
+```
+
+`contacts` 也接受 `events` 别名；每条的 `kind` 可以直接写 `phase`（模型同学的
+`infer_testing.py --out pred.jsonl` 就是这么写的），`down` 会被规范成 tap，
+`slot` / `px` / `py` / `score` 忽略。越界坐标会被丢弃并计入 `rejected`，而不是让循环崩掉
+（注入层仍然保持「越界抛错」的严格语义，兜底放在主程序）。
+
+所以模型侧跑完一段视频后，可以直接把预测喂进注入层：
+
+```bash
+python infer_testing.py --out pred.jsonl        # 模型机
+python3 main.py run --recorded pred.jsonl --backend uinput --lead-in 3
+```
+
+### y 轴方向
+
+标签的 `y` 到底是 +y 向上还是屏幕式 +y 向下，目前仍是 §7 的未决问题。默认按
++y 向上（`Geometry(invert_y=True)`）；真机调试时如果整体上下颠倒，加
+`--no-invert-y` 再试一次，不用改代码。
+
+### 和 cortex-sama 的接口
+
+模型仓库 `Sora3301/cortex-sama` 的 `Sora` 分支现在是：输入 320×180 RGB、
+`float / 255`、`(B,T,3,180,320)`；每帧输出 6 个槽位的 type
+（idle/down/hold/flick）+ 归一化坐标 `[-1,1]`。
+
+主程序已经能消费 `infer_testing.py` 的 JSONL，也能直接跑真模型（见下）。
+
+### 跑真模型（离线视频）
+
+有 torch 的机器上（模型仓库和 checkpoint 都在），可以把一段游戏视频跑完整条回路：
+
+```bash
+python3 main.py run --frames game.mp4 \
+    --model-dir ../cortex-sama \
+    --ckpt ../cortex-sama/checkpoints/1113/epoch_011.pt \
+    --device cuda --capacity 6 --backend dryrun --fps 60
+```
+
+- 视频经 ffmpeg 解码成 320×180 RGB，和训练/推理一致，不经过屏幕采集；
+- `CortexModel` 逐帧维护 GRU `h` 和 TCN cache。cache 目前靠 monkey-patch
+  （`CausalTCN.forward` 的返回值被 `Model._forward` 丢掉了），等模型侧把
+  `tcn_cache` 正式返回后可以删掉；
+- `--capacity 6` 对齐模型的 `n_slot=6`；
+- `--fps` 要和视频帧率一致，否则会快放/慢放；
+- 模型仓库是顶层 `import config` / `import model`，所以要在干净进程里跑
+  （混用别的同名模块会直接报错，不会静默读错常量）。
+
+第一帧是冷启动。需要预热的话在脚本里调 `model.prime(frames)`，CLI 暂不代做。
+
+要接**实时**推理，还差两件事：
+
+1. **流式坐标**：`Model.forward(x, h=h)` 只续了 GRU 的 `h`，坐标分支的
+   `CausalTCN` cache 没有从 `_forward` 返回。逐帧 `T=1` 调用时，训练阶段每个
+   chunk 都有的 16 帧 warmup 历史就丢了，坐标会退化。适配器已经用
+   monkey-patch 兜住，但正式修法还是模型侧把 `tcn_cache` 一起返回。
+2. **y 方向**：见上一节，需要一帧视频叠加确认。
+
+### 每帧打点
+
+`main.py` 输出的四段耗时，单位 µs：
+
+| 段 | 含义 |
+|---|---|
+| `lateness` | deadline → 循环真正开始（只有 realtime 下有定义） |
+| `capture` | 取一帧 |
+| `infer` | 模型推理 |
+| `compile` | `ModelStream.push`：追踪 id + 生命周期 + flick/release 合成 |
+| `inject` | `Injector.apply`：槽位 + 坐标 + uinput 写入 |
+| `tick` | 一轮总耗时；`ticks over one frame` 统计超过 16.7 ms 的次数 |
+
+### 测试
+
+```bash
+python3 -m unittest discover -s beatflow_main/tests -t .
+```
+
+关键用例是 `test_loop.py::ParityTests`：主循环产出的 op 必须和批量路径
+`timeline_from_predictions` 逐帧逐 op 完全一致。主程序改坏了先红这里，不用等游戏。
+
+### 还没接的
+
+- 真实采集（Wayland screencopy / PipeWire）：实现 `frame_source.FrameSource` 协议即可；
+- 实时推理：`CortexModel` 已经写好，等采集接上就能逐帧喂；
+- 游戏状态机（开始 / 暂停 / 结束）与 `ModelStream.reset()`。

@@ -15,8 +15,8 @@ import json
 import sys
 from pathlib import Path
 
-# the repo root *is* the package, so import from its parent
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# the repo root holds the package as a subdirectory
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PIL import Image, ImageDraw                                       # noqa: E402
 
@@ -25,7 +25,7 @@ from beatflow_input.visualizer.scene import (                          # noqa: E
     JUDGMENT_LINE_Y, PALETTE, Scene, Viewport,
 )
 
-ASSETS = Path(__file__).resolve().parent.parent / "visualizer" / "assets"
+ASSETS = Path(__file__).resolve().parent.parent / "beatflow_input" / "visualizer" / "assets"
 SPRITE_ZOOM = 5
 
 W, H = 1100, 620

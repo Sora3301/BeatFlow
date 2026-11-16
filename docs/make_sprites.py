@@ -5,7 +5,7 @@ art pixel). Three ship with a real alpha channel; ``finger3.png`` does not and
 carries a flat black background instead, so it is flood-filled from the border
 before sampling - interior dark pixels of the sprite must survive.
 
-Output: ``visualizer/assets/finger0..3.png``, trimmed to the opaque bounding
+Output: ``beatflow_input/visualizer/assets/finger0..3.png``, trimmed to the opaque bounding
 box, RGBA, 16x16 or smaller. They are then drawn with the *top-right corner of
 the head* on the contact point (see ``tkview.Sprite.origin``), which is what
 "beat point at the top-right of the pattern" means in practice.
@@ -25,7 +25,7 @@ from pathlib import Path
 from PIL import Image
 
 HERE = Path(__file__).resolve().parent
-ASSETS = HERE.parent / "visualizer" / "assets"
+ASSETS = HERE.parent / "beatflow_input" / "visualizer" / "assets"
 ART = 16          # native resolution of the drawings
 BG_TOLERANCE = 12  # max channel value still considered "background black"
 
